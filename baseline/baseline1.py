@@ -47,7 +47,6 @@ def main():
             '--mode', 'optimize',
             '--input', str(default_input),
             '--output', str(default_output),
-            '--start-desc',
             '--save-each',
             '--tune-pair-from', str(base_dir / '71.97.csv'),
             '--force-gpu',
@@ -62,6 +61,11 @@ def main():
         args = parser.parse_args(default_args)
     else:
         args = parser.parse_args()
+
+    # If user points to a different input but leaves output as default, write back to the input file so
+    # the source CSV gets updated after each N (matches the intent of "modify original submission").
+    if args.input != str(default_input) and args.output == str(default_output):
+        args.output = args.input
     if args.mode == 'optimize':
         optimize_pipeline(limit_n=args.limit, input_file=args.input, output_file=args.output,
                   iters=args.iters, restarts=args.restarts, fast_only=args.fast_tiling_only,
