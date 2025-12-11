@@ -41,7 +41,27 @@ def main():
     parser.add_argument('--gpu-min-n', type=int, default=None, help="Minimum N to use GPU path")
     parser.add_argument('--force-gpu', action='store_true', help="Force GPU kernels when CUDA is available (ignores gpu-min-n)")
     parser.add_argument('--max-n', type=int, default=200, help="Maximum N to validate (validate mode)")
-    args = parser.parse_args()
+    # If no CLI args are provided, run with sensible defaults so `python baseline1.py` works out of the box
+    if len(sys.argv) == 1:
+        default_args = [
+            '--mode', 'optimize',
+            '--input', str(default_input),
+            '--output', str(default_output),
+            '--start-desc',
+            '--save-each',
+            '--tune-pair-from', str(base_dir / '71.97.csv'),
+            '--force-gpu',
+            '--pair-block-x', '32',
+            '--pair-block-y', '8',
+            '--bbox-threads', '512',
+            '--gpu-min-n', '0',
+            '--iters', '12',
+            '--restarts', '6',
+            '--jobs', '1',
+        ]
+        args = parser.parse_args(default_args)
+    else:
+        args = parser.parse_args()
     if args.mode == 'optimize':
         optimize_pipeline(limit_n=args.limit, input_file=args.input, output_file=args.output,
                   iters=args.iters, restarts=args.restarts, fast_only=args.fast_tiling_only,
