@@ -12,9 +12,26 @@ from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    EarlyStoppingCallback,
     Trainer,
     TrainingArguments,
 )
+
+def set_seed(seed: int = 42) -> None:
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    try:
+        torch.use_deterministic_algorithms(False)
+    except Exception:
+        pass
+
+
+def get_train_dtype():
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    if torch.cuda.is_available():
+        return torch.float16
+    return torch.float32
 
 # ==========================================
 # 1. CONFIGURATION & DATA LOADING
@@ -124,7 +141,7 @@ class BaristaDataset(Dataset):
             prompt,
             truncation=True,
             max_length=self.max_length,
-            padding="max_length",
+            padding=False,
             return_tensors="pt",
         )["input_ids"][0]
 
@@ -132,7 +149,9 @@ class BaristaDataset(Dataset):
         attention_mask = tokenized["attention_mask"][0]
 
         labels = input_ids.clone()
-        labels[prompt_ids != self.tokenizer.pad_token_id] = -100
+        prompt_len = min(prompt_ids.numel(), self.max_length)
+        labels[:prompt_len] = -100
+        labels[input_ids == self.tokenizer.pad_token_id] = -100
 
         return {
             "input_ids": input_ids,
@@ -145,13 +164,24 @@ class BaristaDataset(Dataset):
 # 4. TRAINING
 # ==========================================
 def train_model():
+    set_seed(42)
+    try:
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    train_dtype = get_train_dtype()
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        torch_dtype=train_dtype,
         device_map="auto" if torch.cuda.is_available() else None,
     )
 
@@ -165,8 +195,22 @@ def train_model():
     )
 
     model = get_peft_model(model, lora_config)
+    model.config.use_cache = False
+    try:
+        model.gradient_checkpointing_enable()
+    except Exception:
+        pass
 
-    dataset = BaristaDataset(TRAIN_DF, tokenizer)
+    eval_ratio = 0.05
+    if len(TRAIN_DF) > 1 and 0.0 < eval_ratio < 1.0:
+        eval_df = TRAIN_DF.sample(frac=eval_ratio, random_state=42)
+        train_df = TRAIN_DF.drop(eval_df.index)
+    else:
+        train_df = TRAIN_DF
+        eval_df = TRAIN_DF
+
+    train_dataset = BaristaDataset(train_df, tokenizer)
+    eval_dataset = BaristaDataset(eval_df, tokenizer)
 
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
@@ -174,17 +218,32 @@ def train_model():
         gradient_accumulation_steps=8,
         num_train_epochs=2,
         learning_rate=2e-4,
-        fp16=torch.cuda.is_available(),
+        fp16=torch.cuda.is_available() and train_dtype == torch.float16,
+        bf16=torch.cuda.is_available() and train_dtype == torch.bfloat16,
         logging_steps=50,
         save_strategy="epoch",
         report_to=[],
+        optim="adamw_torch",
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.05,
+        dataloader_pin_memory=torch.cuda.is_available(),
+        group_by_length=True,
+        gradient_checkpointing=True,
+        evaluation_strategy="steps",
+        eval_steps=100,
+        save_steps=100,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
     )
 
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=dataset,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         tokenizer=tokenizer,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=2, early_stopping_threshold=0.0)],
     )
 
     trainer.train()
@@ -199,10 +258,20 @@ def load_model_for_inference():
     tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR if os.path.exists(OUTPUT_DIR) else MODEL_NAME, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    infer_dtype = get_train_dtype()
+
+    try:
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
 
     base_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        torch_dtype=infer_dtype,
         device_map="auto" if torch.cuda.is_available() else None,
     )
 
@@ -212,26 +281,37 @@ def load_model_for_inference():
         model = base_model
 
     model.eval()
+    model.config.use_cache = True
+    try:
+        if torch.cuda.is_available() and hasattr(torch, "compile"):
+            model = torch.compile(model, mode="reduce-overhead")
+    except Exception:
+        pass
     return model, tokenizer
 
 
-def generate_prediction(model, tokenizer, order_text: str) -> str:
-    prompt = build_prompt(order_text)
-    inputs = tokenizer(prompt, return_tensors="pt")
+def generate_prediction_batch(model, tokenizer, order_texts: List[str]) -> List[str]:
+    prompts = [build_prompt(t) for t in order_texts]
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024)
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-    with torch.no_grad():
+    with torch.inference_mode():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=256,
             do_sample=False,
             temperature=0.0,
             pad_token_id=tokenizer.eos_token_id,
-        )[0]
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,
+        )
 
-    text = tokenizer.decode(output_ids, skip_special_tokens=True)
-    text = text[len(prompt):].strip()
-    return extract_json(text)
+    texts = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+    results = []
+    for prompt, text in zip(prompts, texts):
+        text = text[len(prompt):].strip()
+        results.append(extract_json(text))
+    return results
 
 
 # ==========================================
@@ -249,10 +329,12 @@ def build_submission():
 
     predictions = []
     print(f"Processing {len(TEST_DF)} rows...")
-    for _, row in tqdm(TEST_DF.iterrows(), total=len(TEST_DF)):
-        order_text = row["order"] if "order" in row else row.get("text", "")
-        pred = generate_prediction(model, tokenizer, order_text)
-        predictions.append(pred)
+    batch_size = 8 if torch.cuda.is_available() else 2
+    orders = [row["order"] if "order" in row else row.get("text", "") for _, row in TEST_DF.iterrows()]
+    for i in tqdm(range(0, len(orders), batch_size), total=(len(orders) + batch_size - 1) // batch_size):
+        batch_orders = orders[i:i + batch_size]
+        preds = generate_prediction_batch(model, tokenizer, batch_orders)
+        predictions.extend(preds)
 
     submission = pd.DataFrame({
         id_col: TEST_DF[id_col],
